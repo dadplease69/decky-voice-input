@@ -1,0 +1,11 @@
+{
+  "name": "Voice Input",
+  "author": "dadplease69",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["voice", "speech-to-text", "dictation", "keyboard", "accessibility"],
+    "description": "Офлайн голосовой ввод на Whisper: удерживайте сочетание кнопок и диктуйте в чат Steam и игры. Offline voice typing powered by whisper.cpp.",
+    "image": "https://raw.githubusercontent.com/dadplease69/decky-voice-input/main/assets/store.png"
+  }
+}

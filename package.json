@@ -1,0 +1,19 @@
+{
+  "name": "decky-voice-input",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Offline voice typing for Steam Deck powered by whisper.cpp",
+  "author": "dadplease69",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dadplease69/decky-voice-input.git"
+  },
+  "keywords": [
+    "decky",
+    "plugin",
+    "steam-deck",
+    "speech-to-text",
+    "whisper"
+  ]
+}
