@@ -13,7 +13,7 @@ REPO="${REPO:-dadplease69/decky-voice-input}"
 VERSION="$(python3 -c 'import json;print(json.load(open("package.json"))["version"])')"
 
 
-rm -rf out && mkdir -p "out/$NAME"
+rm -rf out && mkdir -p "out/$NAME" store
 cp -r plugin.json package.json main.py py_modules dist LICENSE README.md "out/$NAME/"
 find "out/$NAME" -name '__pycache__' -prune -exec rm -rf {} +
 (cd out && rm -f "$NAME.zip" && python3 -m zipfile -c "$NAME.zip" "$NAME")
