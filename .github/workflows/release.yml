@@ -1,17 +1,13 @@
 name: release
 
-# Push a tag matching package.json version (e.g. v0.1.0):
-#   git tag v0.1.0 && git push origin v0.1.0
-# CI packs the plugin zip (engine is downloaded from the app, see engine.yml), publishes a GitHub release
-# and updates store/store.json on main (the Decky "Custom" store feed).
+# Push a tag matching package.json version (e.g. v0.2.0):
+#   git tag v0.2.0 && git push origin v0.2.0
+# Builds the frontend, bundles the engine binaries listed in package.json "remote_binary"
+# (verifying their SHA-256, like the Decky store CI does) and publishes an installable zip.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      whisper_ref:
-        description: "whisper.cpp git ref"
-        default: "master"
 
 permissions:
   contents: write
@@ -19,40 +15,41 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    container: debian:bookworm
     steps:
-      - name: Install build deps
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq build-essential cmake git ca-certificates python3 curl >/dev/null
-
       - uses: actions/checkout@v4
 
       - name: Check tag matches package.json
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          V=$(python3 -c 'import json;print(json.load(open("package.json"))["version"])')
+          V=$(jq -r .version package.json)
           [ "v$V" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != package.json v$V"; exit 1; }
 
-      - name: Pack plugin and store feed
-        run: REPO="${GITHUB_REPOSITORY}" bash scripts/make-release.sh
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Fetch engine binaries (remote_binary)
+        run: |
+          mkdir -p bin
+          jq -c '.remote_binary[]' package.json | while read -r b; do
+            name=$(echo "$b" | jq -r .name); url=$(echo "$b" | jq -r .url); sha=$(echo "$b" | jq -r .sha256hash)
+            curl -sSfL -o "bin/$name" "$url"
+            echo "$sha  bin/$name" | sha256sum -c -
+            chmod 755 "bin/$name"
+          done
+
+      - name: Pack plugin
+        run: bash scripts/make-release.sh
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: out/decky-voice-input.zip
-
-      - name: Update store feed on main
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          cp store/store.json /tmp/store.json
-          git fetch origin main
-          git checkout -B main origin/main
-          mkdir -p store && cp /tmp/store.json store/store.json
-          git add store/store.json
-          git commit -m "store: ${GITHUB_REF_NAME}" || echo "no changes"
-          git push origin main

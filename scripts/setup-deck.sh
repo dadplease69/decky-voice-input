@@ -24,8 +24,12 @@ case "${1:-}" in
       [ -e "$STAGE/$f" ] || continue
       rm -rf "${DEST:?}/$f"; cp -r "$STAGE/$f" "$DEST/"
     done
-    if [ -d "$STAGE/bin" ]; then mkdir -p "$DEST/bin"; cp -r "$STAGE/bin/." "$DEST/bin/"; fi
-    [ -f "$DEST/bin/whisper-server" ] && chmod 755 "$DEST/bin/whisper-server"
+    if [ -d "$STAGE/bin" ]; then
+      mkdir -p "$DEST/bin"
+      for b in "$STAGE"/bin/*; do  # tmp + rename: works even while the engine is running
+        install -m 755 "$b" "$DEST/bin/.$(basename "$b").new" && mv -f "$DEST/bin/.$(basename "$b").new" "$DEST/bin/$(basename "$b")"
+      done
+    fi
     chown -R root:root "$DEST"
     systemctl restart plugin_loader
     echo "deployed to $DEST at $(date +%T)";;
@@ -36,7 +40,7 @@ case "${1:-}" in
     echo
     for d in /home/deck/homebrew/logs/*; do
       case "$(basename "$d")" in *oice*) ;; *) continue;; esac
-      for f in $(ls -t "$d"/* 2>/dev/null | head -3); do echo "=== $f ==="; tail -n 200 "$f"; echo; done
+      ls -t "$d"/* 2>/dev/null | head -3 | while IFS= read -r f; do echo "=== $f ==="; tail -n 200 "$f"; echo; done
     done;;
   *) echo "usage: deck-dev.sh deploy|logs"; exit 2;;
 esac

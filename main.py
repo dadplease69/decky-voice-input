@@ -1,12 +1,14 @@
 import asyncio
-import hashlib
+import http.client
 import json
 import math
 import os
+import select
 import signal
 import socket
 import struct
 import subprocess
+import threading
 import time
 import uuid
 
@@ -23,29 +25,36 @@ MODELS = {
 }
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}"
 
-# Prebuilt engines are published by .github/workflows/engine.yml as a GitHub release.
-ENGINE_REPO = "dadplease69/decky-voice-input"
-ENGINE_TAG = "engine-v1"
-ENGINE_URL = "https://github.com/{repo}/releases/download/{tag}/{file}"
-ENGINES = {
-    # variant: (release asset name, legacy names inside plugin bin/ used during development)
-    "vulkan": ("whisper-server-vulkan", ["whisper-server-vulkan"]),
-    "cpu": ("whisper-server-cpu", ["whisper-server-cpu", "whisper-server"]),
-}
+# whisper.cpp server builds shipped in the plugin's bin/ (bundled by the store CI from the
+# engine-v* GitHub release via package.json "remote_binary", see .github/workflows/engine.yml)
+ENGINES = {"vulkan": "whisper-server-vulkan", "cpu": "whisper-server-cpu"}
 
 DEFAULT_SETTINGS = {
     "model": "small-q5_1",
     "language": "ru",          # "ru", "en" or "auto"
-    "hotkey": None,            # {"keys": ["a44", "a45"]} learned on device
-    "type_in_games": True,     # uinput fallback (latin only)
-    "delivery": "steam",       # "steam" = SteamClient.Input.ControllerKeyboardSendText
+    "hotkey": None,            # {"keys": ["L5", "R5"]}, learned in the panel
+    "type_in_games": True,     # /dev/uinput fallback when the Steam keyboard is unavailable (latin only)
     "keep_loaded_sec": 300,    # unload after N s idle; 0 = right after each phrase, -1 = always loaded
     "threads": 8,              # Steam Deck: 4 cores / 8 threads
     "gpu": True,               # prefer the Vulkan engine when installed
-    "fast_mode": False,        # shrink whisper's 30 s encoder window: faster, but repeats/reorders words
     "sounds": True,            # beep on record start/stop instead of toasts
 }
 
+# Steam Deck built-in controller: raw HID reports (same layout as the kernel's hid-steam driver,
+# steam_do_deck_input_event). hidraw delivers every report to every reader, so we can listen
+# alongside Steam — this keeps working while the Steam keyboard or a game has the input focus.
+DECK_HID_ID = "000028DE:00001205"
+DECK_REPORT_ID = 0x09
+HID_BUTTONS = [
+    (8, 0, "R2"), (8, 1, "L2"), (8, 2, "R1"), (8, 3, "L1"),
+    (8, 4, "Y"), (8, 5, "B"), (8, 6, "X"), (8, 7, "A"),
+    (9, 0, "↑"), (9, 1, "→"), (9, 2, "←"), (9, 3, "↓"),
+    (9, 4, "View"), (9, 5, "Steam"), (9, 6, "Menu"), (9, 7, "L5"),
+    (10, 0, "R5"), (10, 6, "L3"), (11, 2, "R3"),
+    (13, 1, "L4"), (13, 2, "R4"), (14, 2, "…"),
+]
+
+LANGUAGES = ("ru", "en", "auto")
 SERVER_PORT = 18178
 MIN_RECORD_SEC = 0.4
 
@@ -145,10 +154,9 @@ class Plugin:
     async def _main(self):
         self.settings_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
         self.models_dir = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "models")
-        self.engine_dir = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "engine")
         self.sounds_dir = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "sounds")
         self.shader_cache = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "shader-cache")
-        for d in (self.models_dir, self.engine_dir, self.sounds_dir, self.shader_cache, decky.DECKY_PLUGIN_SETTINGS_DIR):
+        for d in (self.models_dir, self.sounds_dir, self.shader_cache, decky.DECKY_PLUGIN_SETTINGS_DIR):
             os.makedirs(d, exist_ok=True)
         self.settings = self._load_settings()
         self.gpu_failed = False
@@ -161,23 +169,33 @@ class Plugin:
         self.warm_task = None
         self.last_used = time.time()
         self.download_task = None
-        self.download_state = {"kind": None, "id": None, "progress": 0.0, "error": None}
+        self.download_state = {"id": None, "progress": 0.0, "error": None}
         self.keyboard = None
         self.busy = False
         self._fix_exec_bits()
         self._make_sounds()
-        self.idle_task = asyncio.get_event_loop().create_task(self._idle_watch())
+        self.loop = asyncio.get_event_loop()
+        self.hid_stop = threading.Event()
+        self.hid_threads = {}
+        self.hid_seen = False
+        self.hid_task = self.loop.create_task(self._hid_watch())
+        self.idle_task = self.loop.create_task(self._idle_watch())
         if self.settings.get("keep_loaded_sec") == -1:
             self._preload_quietly()
         decky.logger.info("voice input started, root=%s engine=%s", os.geteuid() == 0, self._engine_variant())
 
     async def _unload(self):
+        self.hid_stop.set()
+        if getattr(self, "hid_task", None):
+            self.hid_task.cancel()
         self._stop_recording_proc()
         self._stop_server()
         if self.keyboard:
             self.keyboard.close()
         if self.idle_task:
             self.idle_task.cancel()
+        if self.download_task and not self.download_task.done():
+            self.download_task.cancel()
 
     async def _uninstall(self):
         pass
@@ -210,9 +228,26 @@ class Plugin:
             json.dump(self.settings, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.settings_path)
 
+    @staticmethod
+    def _valid_setting(key, value):
+        if key == "model":
+            return value in MODELS
+        if key == "language":
+            return value in LANGUAGES
+        if key == "hotkey":
+            return value is None or (isinstance(value, dict) and isinstance(value.get("keys"), list)
+                                     and all(isinstance(k, str) for k in value["keys"]))
+        if key in ("type_in_games", "gpu", "sounds"):
+            return isinstance(value, bool)
+        if key == "keep_loaded_sec":
+            return isinstance(value, int) and value >= -1
+        if key == "threads":
+            return isinstance(value, int) and 1 <= value <= 16
+        return False
+
     async def set_setting(self, key, value):
-        if key not in DEFAULT_SETTINGS:
-            return {"ok": False, "error": f"unknown setting {key}"}
+        if key not in DEFAULT_SETTINGS or not self._valid_setting(key, value):
+            return {"ok": False, "error": f"invalid setting {key}={value!r}"}
         self.settings[key] = value
         self._save_settings()
         if key == "gpu" and value:
@@ -242,10 +277,75 @@ class Plugin:
                 "gpu_mb": gpu,
                 "idle_sec": int(time.time() - self.last_used) if alive else None,
             },
-            "recording": self.rec_proc is not None,
-            "is_root": os.geteuid() == 0,
+            "hid": self.hid_seen,
             "download": self.download_state,
         }
+
+    # ------------------------------------------------------------------ controller (hidraw)
+    @staticmethod
+    def _find_deck_hidraw():
+        found = []
+        try:
+            names = os.listdir("/sys/class/hidraw")
+        except OSError:
+            return found
+        for name in names:
+            try:
+                with open(f"/sys/class/hidraw/{name}/device/uevent") as f:
+                    ue = f.read().upper()
+            except OSError:
+                continue
+            if DECK_HID_ID in ue:
+                found.append("/dev/" + name)
+        return sorted(found)
+
+    async def _hid_watch(self):
+        """(Re)attach readers to the Deck controller — it re-enumerates after sleep."""
+        while not self.hid_stop.is_set():
+            for path in self._find_deck_hidraw():
+                t = self.hid_threads.get(path)
+                if t is None or not t.is_alive():
+                    t = threading.Thread(target=self._hid_reader, args=(path,), daemon=True)
+                    self.hid_threads[path] = t
+                    t.start()
+            await asyncio.sleep(5)
+
+    def _hid_reader(self, path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            decky.logger.info("hidraw %s: %s", path, e)
+            return
+        prev_raw = None
+        prev_names = None
+        try:
+            while not self.hid_stop.is_set():
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if not r:
+                    continue
+                try:
+                    d = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
+                if len(d) != 64 or d[0] != 1 or d[1] != 0 or d[2] != DECK_REPORT_ID:
+                    continue  # other interfaces (lizard-mode keyboard/mouse) or other report types
+                raw = d[8:15]
+                if raw == prev_raw:
+                    continue
+                prev_raw = raw
+                names = sorted(n for b, bit, n in HID_BUTTONS if d[b] & (1 << bit))
+                if names != prev_names:
+                    prev_names = names
+                    if not self.hid_seen:
+                        self.hid_seen = True
+                        decky.logger.info("hid controller input active on %s", path)
+                    asyncio.run_coroutine_threadsafe(decky.emit("hid_buttons", names), self.loop)
+        except OSError as e:
+            decky.logger.info("hidraw %s closed: %s", path, e)
+        finally:
+            os.close(fd)
+            if prev_names:  # device vanished (sleep, reconnect) while buttons were held
+                asyncio.run_coroutine_threadsafe(decky.emit("hid_buttons", []), self.loop)
 
     # ------------------------------------------------------------------ sounds
     def _make_sounds(self):
@@ -273,63 +373,59 @@ class Plugin:
         self._beep(name)
         return True
 
-    # ------------------------------------------------------------------ downloads (models + engines)
+    # ------------------------------------------------------------------ models
     def _model_path(self, mid):
         return os.path.join(self.models_dir, MODELS[mid][0])
-
-    async def _curl_download(self, url, dest, total_hint, kind, item_id):
-        part = dest + ".part"
-        self.download_state = {"kind": kind, "id": item_id, "progress": 0.0, "error": None}
-        total = total_hint
-        head = await asyncio.create_subprocess_exec(
-            "curl", "-sIL", url, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=clean_env())
-        out, _ = await head.communicate()
-        for line in out.decode(errors="ignore").splitlines():
-            if line.lower().startswith("content-length:"):
-                try:
-                    total = int(line.split(":")[1].strip()) or total  # last one wins (after redirects)
-                except ValueError:
-                    pass
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-sSfL", "--retry", "3", "-C", "-", "-o", part, url,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=clean_env())
-        while proc.returncode is None:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=0.7)
-            except asyncio.TimeoutError:
-                pass
-            size = os.path.getsize(part) if os.path.exists(part) else 0
-            self.download_state["progress"] = min(size / total, 0.999) if total else 0
-            await decky.emit("download_progress", self.download_state)
-        if proc.returncode != 0:
-            err = (await proc.stderr.read()).decode(errors="ignore").strip()
-            raise RuntimeError(err or f"curl exit {proc.returncode}")
-        return part
-
-    def _start_download(self, coro):
-        if self.download_task and not self.download_task.done():
-            return {"ok": False, "error": "уже идёт скачивание"}
-        self.download_task = asyncio.get_event_loop().create_task(coro)
-        return {"ok": True}
 
     async def download_model(self, mid):
         if mid not in MODELS:
             return {"ok": False, "error": "unknown model"}
-        return self._start_download(self._download_model(mid))
+        if self.download_task and not self.download_task.done():
+            return {"ok": False, "error": "уже идёт скачивание"}
+        self.download_task = asyncio.get_event_loop().create_task(self._download_model(mid))
+        return {"ok": True}
 
     async def _download_model(self, mid):
+        file, size_mb, _ = MODELS[mid]
+        url = MODEL_URL.format(file=file)
+        dest = self._model_path(mid)
+        part = dest + ".part"
+        total = size_mb * 1024 * 1024
+        self.download_state = {"id": mid, "progress": 0.0, "error": None}
         try:
-            dest = self._model_path(mid)
-            part = await self._curl_download(MODEL_URL.format(file=MODELS[mid][0]), dest,
-                                             MODELS[mid][1] * 1024 * 1024, "model", mid)
+            head = await asyncio.create_subprocess_exec(
+                "curl", "-sIL", url, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=clean_env())
+            out, _ = await head.communicate()
+            for line in out.decode(errors="ignore").splitlines():
+                if line.lower().startswith("content-length:"):
+                    try:
+                        total = int(line.split(":")[1].strip()) or total  # last one wins (after redirects)
+                    except ValueError:
+                        pass
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-sSfL", "--retry", "3", "-C", "-", "-o", part, url,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=clean_env())
+            while proc.returncode is None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.7)
+                except asyncio.TimeoutError:
+                    pass
+                size = os.path.getsize(part) if os.path.exists(part) else 0
+                self.download_state["progress"] = min(size / total, 0.999) if total else 0
+                await decky.emit("download_progress", self.download_state)
+            if proc.returncode != 0:
+                err = (await proc.stderr.read()).decode(errors="ignore").strip()
+                raise RuntimeError(err or f"curl exit {proc.returncode}")
             os.replace(part, dest)
-            self.download_state = {"kind": "model", "id": mid, "progress": 1.0, "error": None}
+            self.download_state = {"id": mid, "progress": 1.0, "error": None}
         except Exception as e:
             decky.logger.error("model download failed: %s", e)
-            self.download_state = {"kind": "model", "id": mid, "progress": 0.0, "error": str(e)}
+            self.download_state = {"id": mid, "progress": 0.0, "error": str(e)}
         await decky.emit("download_progress", self.download_state)
 
     async def delete_model(self, mid):
+        if mid not in MODELS:
+            return {"ok": False, "error": "unknown model"}
         if self.server_key and self.server_key[0] == mid:
             self._stop_server()
         try:
@@ -338,76 +434,20 @@ class Plugin:
             pass
         return {"ok": True}
 
-    async def download_engine(self, variant):
-        if variant not in ENGINES:
-            return {"ok": False, "error": "unknown engine"}
-        return self._start_download(self._download_engine(variant))
-
-    async def _download_engine(self, variant):
-        asset = ENGINES[variant][0]
-        try:
-            sums_url = ENGINE_URL.format(repo=ENGINE_REPO, tag=ENGINE_TAG, file="SHA256SUMS")
-            p = await asyncio.create_subprocess_exec("curl", "-sSfL", sums_url, stdout=subprocess.PIPE,
-                                                     stderr=subprocess.PIPE, env=clean_env())
-            out, err = await p.communicate()
-            if p.returncode != 0:
-                raise RuntimeError("нет релиза движка " + ENGINE_TAG + ": " + err.decode(errors="ignore").strip())
-            expected = None
-            for line in out.decode().splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[1].lstrip("*") == asset:
-                    expected = parts[0].lower()
-            if not expected:
-                raise RuntimeError(f"{asset} нет в SHA256SUMS")
-            dest = os.path.join(self.engine_dir, asset)
-            part = await self._curl_download(ENGINE_URL.format(repo=ENGINE_REPO, tag=ENGINE_TAG, file=asset),
-                                             dest, 40 * 1024 * 1024, "engine", variant)
-            h = hashlib.sha256()
-            with open(part, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-            if h.hexdigest() != expected:
-                os.remove(part)
-                raise RuntimeError("контрольная сумма не совпала, файл удалён")
-            os.chmod(part, 0o755)
-            os.replace(part, dest)
-            if variant == "vulkan":
-                self.gpu_failed = False
-            self.download_state = {"kind": "engine", "id": variant, "progress": 1.0, "error": None}
-        except Exception as e:
-            decky.logger.error("engine download failed: %s", e)
-            self.download_state = {"kind": "engine", "id": variant, "progress": 0.0, "error": str(e)}
-        await decky.emit("download_progress", self.download_state)
-
-    async def delete_engine(self, variant):
-        if self.server_key and self.server_key[3] == variant:
-            self._stop_server()
-        try:
-            os.remove(os.path.join(self.engine_dir, ENGINES[variant][0]))
-        except (KeyError, FileNotFoundError):
-            pass
-        return {"ok": True}
-
     # ------------------------------------------------------------------ engine selection
     def _engine_path(self, variant):
-        asset, legacy = ENGINES[variant]
-        candidates = [os.path.join(self.engine_dir, asset)]
-        candidates += [os.path.join(decky.DECKY_PLUGIN_DIR, "bin", n) for n in legacy]
-        for c in candidates:
-            if os.path.isfile(c) and os.access(c, os.X_OK):
-                return c
-        return None
+        path = os.path.join(decky.DECKY_PLUGIN_DIR, "bin", ENGINES[variant])
+        return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
 
     def _fix_exec_bits(self):
-        # Decky unpacks store zips with ZipFile.extractall, which drops the executable bit
-        for variant in ENGINES:
-            asset, legacy = ENGINES[variant]
-            for c in [os.path.join(self.engine_dir, asset)] + [os.path.join(decky.DECKY_PLUGIN_DIR, "bin", n) for n in legacy]:
-                if os.path.isfile(c) and not os.access(c, os.X_OK):
-                    try:
-                        os.chmod(c, 0o755)
-                    except OSError as e:
-                        decky.logger.error("chmod %s failed: %s", c, e)
+        # Decky unpacks plugin zips with ZipFile.extractall, which drops the executable bit
+        for name in ENGINES.values():
+            path = os.path.join(decky.DECKY_PLUGIN_DIR, "bin", name)
+            if os.path.isfile(path) and not os.access(path, os.X_OK):
+                try:
+                    os.chmod(path, 0o755)
+                except OSError as e:
+                    decky.logger.error("chmod %s failed: %s", path, e)
 
     def _engine_variant(self):
         if self.settings.get("gpu") and not self.gpu_failed and self._engine_path("vulkan"):
@@ -431,7 +471,7 @@ class Plugin:
             return False
         self._stop_server()
         if not variant:
-            raise RuntimeError("Движок не установлен — установите его в панели плагина")
+            raise RuntimeError("Движок не найден в bin/ — переустановите плагин")
         model = self._model_path(self.settings["model"])
         if not os.path.exists(model):
             raise RuntimeError("Модель не скачана")
@@ -439,10 +479,10 @@ class Plugin:
         env = clean_env()
         env["MESA_SHADER_CACHE_DIR"] = self.shader_cache  # keep compiled Vulkan shaders between starts
         env["MESA_SHADER_CACHE_MAX_SIZE"] = "512M"
-        log = open(os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "whisper-server.log"), "ab")
         cmd = [engine, "-m", model, "-l", self.settings["language"], "-t", str(self.settings["threads"]),
                "--host", "127.0.0.1", "--port", str(SERVER_PORT)]
-        self.server_proc = subprocess.Popen(cmd, stdout=log, stderr=log, env=env, start_new_session=True)
+        with open(os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "whisper-server.log"), "ab") as log:
+            self.server_proc = subprocess.Popen(cmd, stdout=log, stderr=log, env=env, start_new_session=True)
         self.server_key = key
         self.server_started_at = time.time()
         self.last_used = time.time()
@@ -485,7 +525,7 @@ class Plugin:
             t0 = time.time()
             silence = b"RIFF" + struct.pack("<I", 36 + 32000) + b"WAVEfmt " + struct.pack(
                 "<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16) + b"data" + struct.pack("<I", 32000) + b"\x00" * 32000
-            await asyncio.get_event_loop().run_in_executor(None, self._post_inference_bytes, silence, False)
+            await asyncio.get_event_loop().run_in_executor(None, self._post_inference_bytes, silence)
             decky.logger.info("warm-up %.2fs (load+warm %.2fs)", time.time() - t0, time.time() - self.server_started_at)
         except asyncio.CancelledError:
             pass
@@ -534,19 +574,8 @@ class Plugin:
         parts.append(f"--{boundary}--\r\n".encode())
         return boundary, b"".join(parts)
 
-    @staticmethod
-    def audio_ctx_for(seconds):
-        """Encoder context (1 unit = 20 ms, full = 1500 = 30 s), rounded up to 64, with margin."""
-        units = int(seconds * 50) + 128
-        units = ((units + 63) // 64) * 64
-        return max(384, min(1500, units))
-
-    def _post_inference_bytes(self, data, allow_fast=True):
-        import http.client
+    def _post_inference_bytes(self, data):
         fields = {"response_format": "json", "temperature": "0.0", "no_timestamps": "true"}
-        if allow_fast and self.settings.get("fast_mode"):
-            seconds = max(0, len(data) - 44) / 32000.0  # 16 kHz mono s16
-            fields["audio_ctx"] = str(self.audio_ctx_for(seconds))
         boundary, body = self._multipart(fields, "file", "audio.wav", data)
         conn = http.client.HTTPConnection("127.0.0.1", SERVER_PORT, timeout=120)
         conn.request("POST", "/inference", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
@@ -612,6 +641,10 @@ class Plugin:
                 decky.logger.info("pw-record: %s", err)
         path = self.rec_path
         if duration < MIN_RECORD_SEC or not os.path.exists(path) or os.path.getsize(path) < 2000:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
             return {"ok": False, "error": "слишком короткая запись", "quiet": True}
         self.busy = True
         t0 = time.time()
@@ -630,11 +663,11 @@ class Plugin:
                 await asyncio.wait([self.warm_task], timeout=10)
             with open(path, "rb") as f:
                 data = f.read()
-            text = await asyncio.get_event_loop().run_in_executor(None, self._post_inference_bytes, data, True)
+            text = await asyncio.get_event_loop().run_in_executor(None, self._post_inference_bytes, data)
             text = " ".join(text.split())  # whisper adds leading spaces / newlines
-            decky.logger.info("inference %.2fs for %.1fs audio, variant=%s threads=%s fast_mode=%s",
+            decky.logger.info("inference %.2fs for %.1fs audio, variant=%s threads=%s",
                               time.time() - t0, duration, self.server_key[3] if self.server_key else "?",
-                              self.settings["threads"], self.settings.get("fast_mode"))
+                              self.settings["threads"])
             self.last_used = time.time()
             return {"ok": True, "text": text, "seconds": round(time.time() - t0, 2),
                     "audio_seconds": round(duration, 1)}
