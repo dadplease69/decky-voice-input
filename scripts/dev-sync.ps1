@@ -3,7 +3,7 @@
 # On every change: copies sources to the Deck, builds the frontend there (podman + node:22),
 # deploys into the installed plugin folder and restarts Decky. Logs are pulled into ..\deck-logs.
 # Needs one-time scripts/setup-deck.sh on the Deck.
-param([string]$DeckHost = "192.168.110.35", [string]$User = "deck")
+param([string]$DeckHost = "steamdeck.local", [string]$User = "deck")
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
 $Target = "$User@$DeckHost"

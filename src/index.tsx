@@ -9,7 +9,7 @@ import {
   staticClasses,
 } from "@decky/ui";
 import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
-import { useEffect, useReducer } from "react";
+import { useEffect, useMemo, useReducer } from "react";
 import { FaMicrophone } from "react-icons/fa";
 
 // ---------------------------------------------------------------- backend API
@@ -33,11 +33,11 @@ type State = {
   engine_variant: "vulkan" | "cpu" | null;
   gpu_failed: boolean;
   server: ServerInfo;
-  is_root: boolean;
   download: DownloadState;
 };
 type Result = { ok: boolean; error?: string };
 type Transcript = Result & { text?: string; seconds?: number; audio_seconds?: number; quiet?: boolean };
+type Option<T> = { data: T; label: string };
 
 const getState = callable<[], State>("get_state");
 const setSetting = callable<[key: string, value: unknown], Result>("set_setting");
@@ -99,14 +99,26 @@ function useStore() {
   return store;
 }
 
+let lastStateJson = "";
 async function refresh() {
   try {
     const state = await getState();
+    // The panel polls every 2 s; re-render only when something actually changed, otherwise
+    // open dropdowns get re-created under the user's finger.
+    const json = JSON.stringify(state);
+    if (json === lastStateJson) return;
+    lastStateJson = json;
     store.set({ state });
     loadCombo(state.settings.hotkey);
   } catch (e) {
     log("get_state failed: " + e, "error");
   }
+}
+
+async function saveSetting(key: string, value: unknown) {
+  const r = await setSetting(key, value);
+  if (!r.ok) toast("Настройка не сохранилась", r.error || key);
+  await refresh();
 }
 
 // ---------------------------------------------------------------- text delivery
@@ -354,12 +366,14 @@ function unregisterHotkey() {
 }
 
 // ---------------------------------------------------------------- panel
-const LANGS = [
+// Dropdown option lists and handlers must keep a stable identity between renders:
+// Steam's dropdown modal is re-created when its props change while it is open.
+const LANGS: Option<string>[] = [
   { data: "ru", label: "Русский" },
   { data: "en", label: "English" },
   { data: "auto", label: "Автоопределение" },
 ];
-const KEEP = [
+const KEEP: Option<number>[] = [
   { data: 0, label: "Выгружать сразу" },
   { data: 10, label: "10 секунд" },
   { data: 60, label: "1 минута" },
@@ -369,6 +383,9 @@ const KEEP = [
   { data: -1, label: "Всегда в памяти" },
 ];
 const ENGINE_LABEL: Record<string, string> = { vulkan: "Видеокарта (Vulkan)", cpu: "Процессор" };
+const onModelChange = (o: { data: any }) => saveSetting("model", o.data);
+const onLanguageChange = (o: { data: any }) => saveSetting("language", o.data);
+const onKeepChange = (o: { data: any }) => saveSetting("keep_loaded_sec", o.data);
 
 function fmtLeft(sec: number) {
   sec = Math.max(0, Math.round(sec));
@@ -399,11 +416,18 @@ function memoryText(st: State) {
 function Content() {
   const s = useStore();
   useEffect(() => {
+    lastStateJson = ""; // force one render with fresh data when the panel opens
     refresh();
     const t = setInterval(refresh, 2000); // live memory / countdown while the panel is open
     return () => clearInterval(t);
   }, []);
   const st = s.state;
+  // Rebuilt only when the model list really changes (e.g. a download finished).
+  const modelsKey = st ? st.models.map((m) => `${m.id}:${m.installed ? 1 : 0}`).join(",") : "";
+  const modelOptions = useMemo<Option<string>[]>(
+    () => (st ? st.models.map((m) => ({ data: m.id, label: `${m.installed ? "✓ " : ""}${m.label}` })) : []),
+    [modelsKey]
+  );
   if (!st) {
     return (
       <PanelSection>
@@ -418,10 +442,6 @@ function Content() {
   const dl = st.download;
   const downloading = !!dl.id && !dl.error && dl.progress > 0 && dl.progress < 1;
   const ready = !!st.engine_variant && model.installed;
-  const set = async (key: string, value: unknown) => {
-    await setSetting(key, value);
-    refresh();
-  };
 
   return (
     <>
@@ -467,12 +487,7 @@ function Content() {
 
       <PanelSection title="Модель">
         <PanelSectionRow>
-          <DropdownItem
-            label="Модель"
-            rgOptions={st.models.map((m) => ({ data: m.id, label: `${m.installed ? "✓ " : ""}${m.label}` }))}
-            selectedOption={settings.model}
-            onChange={(o) => set("model", o.data)}
-          />
+          <DropdownItem label="Модель" rgOptions={modelOptions} selectedOption={settings.model} onChange={onModelChange} />
         </PanelSectionRow>
         <PanelSectionRow>
           {model.installed ? (
@@ -504,7 +519,7 @@ function Content() {
           </PanelSectionRow>
         )}
         <PanelSectionRow>
-          <DropdownItem label="Язык" rgOptions={LANGS} selectedOption={settings.language} onChange={(o) => set("language", o.data)} />
+          <DropdownItem label="Язык" rgOptions={LANGS} selectedOption={settings.language} onChange={onLanguageChange} />
         </PanelSectionRow>
       </PanelSection>
 
@@ -517,11 +532,11 @@ function Content() {
         </PanelSectionRow>
         {st.engines.vulkan && (
           <PanelSectionRow>
-            <ToggleField label="Использовать видеокарту" description="В 5–7 раз быстрее процессора" checked={settings.gpu} onChange={(v) => set("gpu", v)} />
+            <ToggleField label="Использовать видеокарту" description="В 5–7 раз быстрее процессора" checked={settings.gpu} onChange={(v) => saveSetting("gpu", v)} />
           </PanelSectionRow>
         )}
         <PanelSectionRow>
-          <DropdownItem label="Держать модель в памяти" rgOptions={KEEP} selectedOption={settings.keep_loaded_sec} onChange={(o) => set("keep_loaded_sec", o.data)} />
+          <DropdownItem label="Держать модель в памяти" rgOptions={KEEP} selectedOption={settings.keep_loaded_sec} onChange={onKeepChange} />
         </PanelSectionRow>
         <PanelSectionRow>
           <Field label="Сейчас в памяти" description={memoryText(st)} />
@@ -556,14 +571,14 @@ function Content() {
 
       <PanelSection title="Дополнительно">
         <PanelSectionRow>
-          <ToggleField label="Звуковые сигналы" description="Начало и конец записи" checked={settings.sounds} onChange={(v) => set("sounds", v)} />
+          <ToggleField label="Звуковые сигналы" description="Начало и конец записи" checked={settings.sounds} onChange={(v) => saveSetting("sounds", v)} />
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
             label="Печатать в играх (латиница)"
             description="Запасной способ, если клавиатура Steam недоступна"
             checked={settings.type_in_games}
-            onChange={(v) => set("type_in_games", v)}
+            onChange={(v) => saveSetting("type_in_games", v)}
           />
         </PanelSectionRow>
       </PanelSection>

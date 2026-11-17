@@ -1,6 +1,6 @@
 {
   "name": "decky-voice-input",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Offline voice typing for Steam Deck powered by whisper.cpp",
   "type": "module",
   "scripts": {

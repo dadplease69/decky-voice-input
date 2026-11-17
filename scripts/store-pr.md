@@ -34,7 +34,7 @@ The plugin's code was written with substantial help from an AI assistant (Claude
 
 ### Plugin
 
-- [ ] I have verified that my plugin works properly on the Stable and Beta update channels of SteamOS. — Tested on SteamOS __CHANNEL__ (Steam Deck __MODEL__).
+- [ ] I have verified that my plugin works properly on the Stable and Beta update channels of SteamOS. — Tested on SteamOS **Stable** (Steam Deck **OLED**); Beta not tested yet.
 - [x] I have verified my plugin is unique or provides more/alternative functionality to a plugin already on the store.
 
 ### Backend
@@ -50,4 +50,4 @@ The plugin's code was written with substantial help from an AI assistant (Claude
 
 ## Testing
 
-- [ ] Third-party tested on SteamOS Preview channel.
+- [ ] Tested by a third party on SteamOS Preview update channel.
